@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.backend.playback import engine
+from app.backend.metrics import metrics_collector
 from perception.loader import get_frame_count
 from perception.service import get_active_backend, set_active_backend
 
@@ -199,8 +200,18 @@ async def switch_perception_backend(name: Literal["groundtruth", "model"] = Quer
 
 @app.get("/metrics", tags=["Metrics"])
 async def get_pipeline_metrics():
-    """Retrieve real-time latency, throughput, and memory telemetry."""
-    return engine.get_telemetry()
+    """
+    Retrieve real-time pipeline metrics from rolling window of last 30 frames.
+
+    Fields:
+    - fps: Empirically measured frame rate (not configured target)
+    - latency_ms: Per-stage breakdown (classify, project, serialize, total)
+    - memory_saved_pct: Live adaptive vs uniform cell count reduction
+    - point_count: LiDAR points processed in latest frame
+    - backend: Active perception backend identifier
+    - window_samples: Rolling-window sample count
+    """
+    return metrics_collector.get_metrics()
 
 
 if __name__ == "__main__":

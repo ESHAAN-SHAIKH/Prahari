@@ -25,6 +25,7 @@ from grid_engine.serialize import grid_to_dict
 from grid_engine.uniform_grid import UniformGrid
 from perception.loader import get_frame_count
 from perception.service import classify_frame, get_active_backend, set_active_backend
+from app.backend.metrics import metrics_collector
 
 logger = logging.getLogger("playback.engine")
 
@@ -129,6 +130,16 @@ class PlaybackEngine:
             self.telemetry["memory_stats"]["adaptive_cells"] = n_adapt
             self.telemetry["memory_stats"]["uniform_cells"] = n_unif
             self.telemetry["memory_stats"]["reduction_pct"] = round(reduct_pct, 2)
+
+        # Record in global metrics collector
+        metrics_collector.record_frame(
+            classify_ms=dt_perception,
+            project_ms=dt_grid_adaptive,
+            serialize_ms=dt_serialization,
+            total_ms=dt_total,
+            point_count=len(points),
+            memory_saved_pct=reduct_pct,
+        )
 
         return adaptive_payload, uniform_payload
 

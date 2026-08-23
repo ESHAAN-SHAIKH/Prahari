@@ -1,42 +1,40 @@
 """
 fetch_demo_sequence.py
 ======================
-Acquires and trims the demo LiDAR sequence used throughout PRAHARI-Lite.
+Acquires and trims the real demo LiDAR sequence used throughout PRAHARI-Lite.
 
 Data sources
 ------------
 * SemanticKITTI labels (179 MB, no login required):
       http://semantic-kitti.org/assets/data_odometry_labels.zip
-* KITTI Odometry velodyne (80 GB, requires free KITTI account):
-      https://www.cvlibs.net/datasets/kitti/eval_odometry.php
-      -> download "Velodyne point clouds (80 GB)"
-      Extract sequences/04/velodyne/ into data/raw/sequences/04/velodyne/
+* KITTI Velodyne LiDAR (Public AWS S3 bucket - 2011_09_30_drive_0016_sync):
+      https://s3.eu-central-1.amazonaws.com/avg-kitti/raw_data/2011_09_30_drive_0016/2011_09_30_drive_0016_sync.zip
 
-[ASSUMPTION] Using SemanticKITTI sequence 04, all 271 available frames
-(000000-000270).  The blueprint targets frames 0-400 but sequence 04
-only has 271 -- so we use all of them.  Sequence 04 contains a clear
-road segment with cars, pedestrians, and static infrastructure, making
-it ideal as the demo "hero" sequence.
+Sequence 04 corresponds to KITTI Raw: 2011_09_30 Drive 0016 (271 frames).
 
 Usage
 -----
-    # Full acquisition (velodyne must already be downloaded manually):
+    # Download and prepare original real data:
     python perception/scripts/fetch_demo_sequence.py
 
-    # Download only the labels (no velodyne needed yet):
+    # Download only labels:
     python perception/scripts/fetch_demo_sequence.py --labels-only
 
-    # Generate synthetic placeholder data for immediate dev/CI:
-    python perception/scripts/fetch_demo_sequence.py --synthetic
+    # Download only velodyne:
+    python perception/scripts/fetch_demo_sequence.py --velodyne-only
 
-    # Skip download if files already exist:
-    python perception/scripts/fetch_demo_sequence.py --skip-download
+    # Generate synthetic placeholder data for offline dev:
+    python perception/scripts/fetch_demo_sequence.py --synthetic
 """
 
 import argparse
+import os
+import shutil
 import sys
+import time
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import requests
@@ -52,6 +50,12 @@ POINTS_PER_FRAME: int = 120_000          # synthetic fallback: pts/frame
 LABELS_URL: str = "http://semantic-kitti.org/assets/data_odometry_labels.zip"
 LABELS_FILENAME: str = "data_odometry_labels.zip"
 
+VELODYNE_URL: str = (
+    "https://s3.eu-central-1.amazonaws.com/avg-kitti/raw_data/"
+    "2011_09_30_drive_0016/2011_09_30_drive_0016_sync.zip"
+)
+VELODYNE_FILENAME: str = "2011_09_30_drive_0016_sync.zip"
+
 # Paths (relative to project root -- run this script from PRAHARI/)
 ROOT_DIR = Path(__file__).resolve().parents[2]
 RAW_DIR      = ROOT_DIR / "data" / "raw"
@@ -61,80 +65,164 @@ LABELS_SRC   = RAW_DIR / "sequences" / TARGET_SEQUENCE / "labels"
 VELODYNE_DST = DEMO_DIR / "velodyne"
 LABELS_DST   = DEMO_DIR / "labels"
 
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Resumable, robust HTTP downloader
 # ---------------------------------------------------------------------------
 
-def _download_with_progress(url: str, dest: Path) -> None:
-    """Stream-download url to dest, showing a tqdm progress bar."""
+def download_resumable(
+    url: str,
+    dest: Path,
+    max_retries: int = 20,
+    timeout: int = 30,
+) -> bool:
+    """
+    Download url to dest with automatic HTTP Range resume and exponential backoff.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    print("Downloading {} -> {} ...".format(url, dest))
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        with open(dest, "wb") as f, tqdm(
-            total=total, unit="B", unit_scale=True, desc=dest.name
-        ) as bar:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                f.write(chunk)
-                bar.update(len(chunk))
+    temp_dest = dest.with_suffix(dest.suffix + ".part")
+
+    for attempt in range(1, max_retries + 1):
+        existing_size = temp_dest.stat().st_size if temp_dest.exists() else 0
+        headers = {}
+        if existing_size > 0:
+            headers["Range"] = f"bytes={existing_size}-"
+
+        try:
+            print(f"[{attempt}/{max_retries}] Connecting to {url} (resuming from {existing_size / (1024*1024):.2f} MB) ...")
+            with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+                if r.status_code not in (200, 206, 416):
+                    r.raise_for_status()
+
+                if r.status_code == 416:
+                    # Requested range not satisfiable -> file is already fully downloaded
+                    print(f"File already complete: {temp_dest.name}")
+                    break
+
+                total_size = int(r.headers.get("content-length", 0)) + existing_size
+                mode = "ab" if existing_size > 0 and r.status_code == 206 else "wb"
+                if mode == "wb":
+                    existing_size = 0
+
+                with open(temp_dest, mode) as f, tqdm(
+                    total=total_size,
+                    initial=existing_size,
+                    unit="B",
+                    unit_scale=True,
+                    desc=dest.name,
+                ) as bar:
+                    for chunk in r.iter_content(chunk_size=1 << 20):  # 1 MB chunks
+                        if chunk:
+                            f.write(chunk)
+                            bar.update(len(chunk))
+
+            # Download finished successfully
+            break
+
+        except (requests.RequestException, IOError) as exc:
+            print(f"\n[WARN] Connection issue: {exc}. Retrying in {min(2 ** attempt, 15)}s...", file=sys.stderr)
+            time.sleep(min(2 ** attempt, 15))
+    else:
+        print(f"[ERROR] Failed to download {url} after {max_retries} attempts.", file=sys.stderr)
+        return False
+
+    if temp_dest.exists():
+        if dest.exists():
+            dest.unlink()
+        temp_dest.rename(dest)
+        print(f"[OK] Downloaded: {dest} ({dest.stat().st_size / (1024*1024):.2f} MB)")
+        return True
+
+    return False
 
 
-def _extract_sequence_from_zip(zip_path: Path, seq: str, src_dir: Path) -> None:
-    """Extract only the labels for seq from the zip into src_dir."""
-    prefix = "dataset/sequences/{}/labels/".format(seq)
+# ---------------------------------------------------------------------------
+# Extraction & Conversion Helpers
+# ---------------------------------------------------------------------------
+
+def extract_labels_from_zip(zip_path: Path, seq: str, src_dir: Path) -> bool:
+    """Extract SemanticKITTI labels for seq from zip into src_dir."""
+    prefix = f"dataset/sequences/{seq}/labels/"
     src_dir.mkdir(parents=True, exist_ok=True)
-    print("Extracting {} from {} ...".format(prefix, zip_path.name))
+    print(f"Extracting {prefix} from {zip_path.name} ...")
     with zipfile.ZipFile(zip_path) as zf:
         members = [m for m in zf.namelist() if m.startswith(prefix) and m.endswith(".label")]
+        if not members:
+            print(f"[ERROR] No labels found in {zip_path} matching {prefix}", file=sys.stderr)
+            return False
         for member in tqdm(members, desc="Extracting labels"):
             data = zf.read(member)
             out_file = src_dir / Path(member).name
             out_file.write_bytes(data)
-    print("  Extracted {} label files -> {}".format(len(members), src_dir))
+    print(f"  Extracted {len(members)} label files -> {src_dir}")
+    return True
 
 
-def _trim_and_copy(src: Path, dst: Path, frame_range: tuple, ext: str) -> list:
+def extract_velodyne_from_sync_zip(zip_path: Path, src_dir: Path) -> bool:
+    """Extract velodyne point clouds from KITTI raw sync.zip and standardize filenames."""
+    src_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Extracting Velodyne scans from {zip_path.name} ...")
+    
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [
+            m for m in zf.namelist() 
+            if "velodyne_points/data/" in m and m.endswith(".bin")
+        ]
+        members.sort()
+        if not members:
+            print(f"[ERROR] No velodyne .bin files found in {zip_path}", file=sys.stderr)
+            return False
+
+        print(f"  Found {len(members)} point cloud scans in archive.")
+        for idx, member in enumerate(tqdm(members, desc="Extracting velodyne")):
+            data = zf.read(member)
+            # Standardize filename to 6 digits (000000.bin, 000001.bin, ...)
+            out_file = src_dir / f"{idx:06d}.bin"
+            out_file.write_bytes(data)
+
+    print(f"  Standardized {len(members)} velodyne scans -> {src_dir}")
+    return True
+
+
+def trim_and_copy(src: Path, dst: Path, frame_range: tuple, ext: str) -> list:
     """Copy frames [frame_range[0], frame_range[1]) from src to dst."""
     dst.mkdir(parents=True, exist_ok=True)
     start, end = frame_range
     copied = []
     for i in range(start, end):
-        fname = "{:06d}.{}".format(i, ext)
+        fname = f"{i:06d}.{ext}"
         src_file = src / fname
         dst_file = dst / fname
         if not src_file.exists():
-            print("  [WARN] Missing frame: {} -- skipping".format(src_file), file=sys.stderr)
+            print(f"  [WARN] Missing frame: {src_file} -- skipping", file=sys.stderr)
             continue
         dst_file.write_bytes(src_file.read_bytes())
         copied.append(fname)
     return copied
 
 
-def _verify_counts(velodyne_dir: Path, labels_dir: Path) -> bool:
+def verify_counts(velodyne_dir: Path, labels_dir: Path) -> bool:
     """Return True if frame counts match and are non-zero."""
     bins   = sorted(velodyne_dir.glob("*.bin"))
     labels = sorted(labels_dir.glob("*.label"))
     ok = len(bins) == len(labels) and len(bins) > 0
     if ok:
-        print("[OK] Frame/label count match: {} frames each.".format(len(bins)))
+        print(f"[OK] Frame/label count match: {len(bins)} frames each.")
     else:
         print(
-            "[FAIL] Mismatch: {} .bin frames vs {} .label files.".format(len(bins), len(labels)),
+            f"[FAIL] Mismatch: {len(bins)} .bin frames vs {len(labels)} .label files.",
             file=sys.stderr,
         )
     return ok
 
 
 # ---------------------------------------------------------------------------
-# Synthetic data generation (development fallback)
+# Synthetic fallback
 # ---------------------------------------------------------------------------
 
 def _write_synthetic_bin(path: Path, n_points: int = POINTS_PER_FRAME) -> None:
-    """Write a synthetic KITTI .bin point-cloud (x,y,z,intensity) float32."""
     rng = np.random.default_rng(seed=int(path.stem))
     pts = rng.standard_normal((n_points, 4)).astype(np.float32)
-    # Realistic-ish spatial spread: x,y +-30 m, z -1 to +2.5 m, intensity 0-1
     pts[:, :2] *= 30.0
     pts[:, 2]   = rng.uniform(-1.0, 2.5, n_points).astype(np.float32)
     pts[:, 3]   = rng.uniform(0.0, 1.0, n_points).astype(np.float32)
@@ -142,17 +230,6 @@ def _write_synthetic_bin(path: Path, n_points: int = POINTS_PER_FRAME) -> None:
 
 
 def _write_synthetic_label(path: Path, n_points: int = POINTS_PER_FRAME) -> None:
-    """Write a synthetic .label file (uint32 per point, SemanticKITTI format).
-
-    Label encoding:  lower 16 bits = semantic id, upper 16 bits = instance id.
-    Class distribution:
-        40 (road)       ~40%
-        50 (building)   ~15%
-        71 (pole)        ~5%
-        30 (person)      ~5%
-        10 (car)        ~10%
-         0 (unlabeled)  ~25%
-    """
     rng = np.random.default_rng(seed=int(path.stem) + 9999)
     raw_classes = rng.choice(
         [40, 50, 71, 30, 10, 0],
@@ -168,144 +245,115 @@ def generate_synthetic_sequence(
     frame_range: tuple,
     n_points: int = POINTS_PER_FRAME,
 ) -> None:
-    """Generate synthetic .bin and .label files for CI / offline development."""
     velodyne_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
     start, end = frame_range
-    print("Generating {} synthetic frames ({} pts/frame) ...".format(end - start, n_points))
+    print(f"Generating {end - start} synthetic frames ({n_points} pts/frame) ...")
     for i in tqdm(range(start, end), desc="Synthetic frames"):
-        _write_synthetic_bin(velodyne_dir / "{:06d}.bin".format(i), n_points)
-        _write_synthetic_label(labels_dir / "{:06d}.label".format(i), n_points)
-    print("[OK] Synthetic sequence written to {}".format(velodyne_dir.parent))
+        _write_synthetic_bin(velodyne_dir / f"{i:06d}.bin", n_points)
+        _write_synthetic_label(labels_dir / f"{i:06d}.label", n_points)
+    print(f"[OK] Synthetic sequence written to {velodyne_dir.parent}")
 
 
 # ---------------------------------------------------------------------------
-# Main flow
+# Main Orchestration
 # ---------------------------------------------------------------------------
 
-def download_labels(skip_if_exists: bool = False) -> bool:
-    """Download and extract SemanticKITTI labels for TARGET_SEQUENCE."""
-    zip_dest = RAW_DIR / LABELS_FILENAME
+def acquire_original_data(labels_only: bool = False, velodyne_only: bool = False) -> bool:
+    """Download and extract real SemanticKITTI labels and real KITTI Velodyne scans."""
+    labels_zip = RAW_DIR / LABELS_FILENAME
+    velodyne_zip = RAW_DIR / VELODYNE_FILENAME
 
-    if skip_if_exists and LABELS_SRC.exists() and any(LABELS_SRC.glob("*.label")):
-        print("Labels already present at {} -- skipping download.".format(LABELS_SRC))
+    # 1. Download & Extract Labels
+    if not velodyne_only:
+        print("\n--- [1/2] Acquiring SemanticKITTI Labels (179 MB) ---")
+        if not labels_zip.exists() or labels_zip.stat().st_size < 170 * 1024 * 1024:
+            part_file = RAW_DIR / "data_odometry_labels.zip.part"
+            if not part_file.exists() and (RAW_DIR / "data_odometry_labels.zip").exists():
+                (RAW_DIR / "data_odometry_labels.zip").rename(part_file)
+
+            ok = download_resumable(LABELS_URL, labels_zip)
+            if not ok:
+                return False
+        else:
+            print(f"Labels zip already present: {labels_zip}")
+
+        print("\n--- Extracting Sequence 04 Labels ---")
+        if not LABELS_SRC.exists() or len(list(LABELS_SRC.glob("*.label"))) < 271:
+            ok = extract_labels_from_zip(labels_zip, TARGET_SEQUENCE, LABELS_SRC)
+            if not ok:
+                return False
+        else:
+            print(f"Sequence 04 labels already extracted in {LABELS_SRC}")
+
+    if labels_only:
         return True
 
-    # Download labels zip
-    if not zip_dest.exists():
-        try:
-            _download_with_progress(LABELS_URL, zip_dest)
-        except Exception as exc:
-            print("[ERROR] Label download failed: {}".format(exc), file=sys.stderr)
+    # 2. Download & Extract Velodyne Scans
+    print("\n--- [2/2] Acquiring KITTI Velodyne LiDAR (AWS S3, ~1.1 GB) ---")
+    if not velodyne_zip.exists() or velodyne_zip.stat().st_size < 1_000_000_000:
+        ok = download_resumable(VELODYNE_URL, velodyne_zip)
+        if not ok:
             return False
     else:
-        print("Labels zip already cached at {}.".format(zip_dest))
+        print(f"Velodyne zip already present: {velodyne_zip}")
 
-    # Extract
-    _extract_sequence_from_zip(zip_dest, TARGET_SEQUENCE, LABELS_SRC)
+    print("\n--- Extracting & Standardizing Velodyne Scans ---")
+    if not VELODYNE_SRC.exists() or len(list(VELODYNE_SRC.glob("*.bin"))) < 271:
+        ok = extract_velodyne_from_sync_zip(velodyne_zip, VELODYNE_SRC)
+        if not ok:
+            return False
+    else:
+        print(f"Velodyne scans already extracted in {VELODYNE_SRC}")
+
     return True
-
-
-def check_velodyne_available() -> bool:
-    """Check whether velodyne data for TARGET_SEQUENCE exists locally."""
-    bins = list(VELODYNE_SRC.glob("*.bin")) if VELODYNE_SRC.exists() else []
-    if bins:
-        print("Velodyne data found: {} .bin files at {}".format(len(bins), VELODYNE_SRC))
-        return True
-
-    msg = (
-        "\n" + "=" * 72 + "\n"
-        "MANUAL STEP REQUIRED -- Velodyne point clouds\n"
-        "=" * 72 + "\n"
-        "The KITTI velodyne archive requires a free account at:\n"
-        "  https://www.cvlibs.net/datasets/kitti/eval_odometry.php\n\n"
-        "1. Register / log in.\n"
-        "2. Download 'Velodyne point clouds (80 GB)' -> data_odometry_velodyne.zip\n"
-        "3. Extract ONLY sequences/04/velodyne/ from the zip to:\n"
-        "   {}\n\n"
-        "Then re-run this script (it will skip the labels re-download).\n"
-        "Or run with --synthetic to generate placeholder data now.\n"
-        + "=" * 72 + "\n"
-    ).format(VELODYNE_SRC)
-    print(msg, file=sys.stderr)
-    return False
 
 
 def trim_sequence() -> bool:
     """Copy the trimmed frame window from raw -> demo_sequence."""
-    print("\nTrimming frames {}-{} ...".format(FRAME_RANGE[0], FRAME_RANGE[1] - 1))
+    print(f"\nPopulating data/demo_sequence with frames {FRAME_RANGE[0]}-{FRAME_RANGE[1]-1} ...")
+    bins   = trim_and_copy(VELODYNE_SRC, VELODYNE_DST, FRAME_RANGE, "bin")
+    labels = trim_and_copy(LABELS_SRC,   LABELS_DST,   FRAME_RANGE, "label")
 
-    bins   = _trim_and_copy(VELODYNE_SRC, VELODYNE_DST, FRAME_RANGE, "bin")
-    labels = _trim_and_copy(LABELS_SRC,   LABELS_DST,   FRAME_RANGE, "label")
-
-    if not bins:
-        print("[ERROR] No .bin frames were copied.", file=sys.stderr)
-        return False
-    if not labels:
-        print("[ERROR] No .label files were copied.", file=sys.stderr)
+    if not bins or not labels:
+        print("[ERROR] Failed copying frames to demo_sequence", file=sys.stderr)
         return False
 
-    print("  Copied {} .bin  frames -> {}".format(len(bins), VELODYNE_DST))
-    print("  Copied {} .label files -> {}".format(len(labels), LABELS_DST))
+    print(f"  Copied {len(bins)} .bin frames -> {VELODYNE_DST}")
+    print(f"  Copied {len(labels)} .label files -> {LABELS_DST}")
     return True
 
 
 def main(args: argparse.Namespace) -> int:
     print("=" * 60)
     print("PRAHARI-Lite -- fetch_demo_sequence.py")
-    print("  Sequence : {}".format(TARGET_SEQUENCE))
-    print("  Frames   : {} - {}".format(FRAME_RANGE[0], FRAME_RANGE[1] - 1))
-    print("  Mode     : {}".format("synthetic" if args.synthetic else "real"))
-    print("=" * 60 + "\n")
+    print(f"  Sequence : {TARGET_SEQUENCE}")
+    print(f"  Frames   : {FRAME_RANGE[0]} - {FRAME_RANGE[1] - 1}")
+    print(f"  Mode     : {'synthetic' if args.synthetic else 'real'}")
+    print("=" * 60)
 
-    # -- Synthetic path -------------------------------------------------------
     if args.synthetic:
         generate_synthetic_sequence(VELODYNE_DST, LABELS_DST, FRAME_RANGE)
-        ok = _verify_counts(VELODYNE_DST, LABELS_DST)
+        ok = verify_counts(VELODYNE_DST, LABELS_DST)
         return 0 if ok else 1
 
-    # -- Real data path -------------------------------------------------------
-    if not args.skip_download and not args.velodyne_only:
-        ok = download_labels(skip_if_exists=True)
-        if not ok:
-            return 1
-
-    if args.labels_only:
-        print("--labels-only: skipping velodyne check and trim.")
-        return 0
-
-    if not check_velodyne_available():
+    ok = acquire_original_data(labels_only=args.labels_only, velodyne_only=args.velodyne_only)
+    if not ok:
+        print("\n[ERROR] Failed to acquire original data.", file=sys.stderr)
         return 1
+
+    if args.labels_only or args.velodyne_only:
+        print("\n[INFO] Partial acquisition complete.")
+        return 0
 
     if not trim_sequence():
         return 1
 
-    ok = _verify_counts(VELODYNE_DST, LABELS_DST)
+    ok = verify_counts(VELODYNE_DST, LABELS_DST)
     if not ok:
         return 1
 
-    # Check the "hero moment" heuristic -- we want at least some person (30)
-    # and car (10) labels in the first 10 frames.
-    print("\nChecking for hero-moment classes (pedestrian + vehicle) ...")
-    found_person = False
-    found_car    = False
-    for i in range(min(10, FRAME_RANGE[1] - FRAME_RANGE[0])):
-        lbl_path = LABELS_DST / "{:06d}.label".format(i)
-        if lbl_path.exists():
-            raw = np.frombuffer(lbl_path.read_bytes(), dtype=np.uint32)
-            sem = raw & 0xFFFF
-            if 30 in sem:
-                found_person = True
-            if 10 in sem:
-                found_car = True
-    if found_person and found_car:
-        print("[OK] Hero-moment classes detected (person + car) in sequence.")
-    elif not found_person:
-        print("[WARN] No pedestrian (class 30) detected in first 10 frames.")
-    elif not found_car:
-        print("[WARN] No vehicle (class 10) detected in first 10 frames.")
-
-    print("\nTASK-002 complete. data/demo_sequence/ is ready.")
+    print("\n[SUCCESS] Original real LiDAR sequence 04 is fully downloaded and verified!")
     return 0
 
 
@@ -324,11 +372,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--velodyne-only",
         action="store_true",
-        help="Skip label download (labels already present); just trim velodyne.",
-    )
-    parser.add_argument(
-        "--skip-download",
-        action="store_true",
-        help="Skip all downloads; assume raw/ is already populated.",
+        help="Skip label download; just download velodyne.",
     )
     sys.exit(main(parser.parse_args()))

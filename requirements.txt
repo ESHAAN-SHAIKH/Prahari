@@ -1,0 +1,21 @@
+# PRAHARI-Lite — Python dependencies
+# Core pipeline
+numpy
+scipy
+fastapi
+uvicorn[standard]
+pydantic
+
+# Data loading & utilities
+requests
+tqdm
+
+# Testing
+pytest
+
+# Optional: model backend (install separately if attempting TASK-005)
+# torch --index-url https://download.pytorch.org/whl/cpu
+
+# Optional: Streamlit frontend path (alternative to React)
+# streamlit
+# plotly

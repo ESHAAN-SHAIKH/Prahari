@@ -1,0 +1,36 @@
+# ── Virtual environment ──────────────────────────────────────────────────────
+.venv/
+venv/
+
+# ── Python bytecode ──────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Dataset files — NEVER commit these ──────────────────────────────────────
+data/*.bin
+data/*.label
+data/demo_sequence/
+
+# ── Node / frontend ──────────────────────────────────────────────────────────
+node_modules/
+dist/
+build/
+app/frontend/node_modules/
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── pytest / coverage cache ──────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Reports (generated, not source) ─────────────────────────────────────────
+docs/reports/

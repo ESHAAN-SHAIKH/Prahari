@@ -1,21 +1,20 @@
 """
 ring_grid.py
 ============
-Distance-Tiered Variable-Resolution 2.5D Elevation & Semantic Grid Engine.
+Distance-Tiered Variable-Resolution 2.5D Elevation & Semantic Grid Engine
+with Risk-Adaptive Local Subdivision.
 
 Implements concentric ring-based spatial decomposition:
     - Tier 0 (Near field:  0.0m - 10.0m) : 0.05m (5cm)  resolution
     - Tier 1 (Mid range:  10.0m - 30.0m) : 0.15m (15cm) resolution
     - Tier 2 (Far field:  30.0m - 100.0m): 0.50m (50cm) resolution
 
-Key Properties:
----------------
-1. Fully Vectorized NumPy Projection: Utilizes unbuffered C-level `np.maximum.at` /
-   `np.minimum.at` and `bincount` for blazing throughput (>30-60 FPS).
-2. Strict Boundary Rules: Points exactly at tier boundaries (e.g. r=10.0m) belong
-   to the inner (finer) tier without ambiguity or double assignment.
-3. Safety Priority Majority Voting: Dynamic hazard classes (pedestrians, vehicles,
-   obstacles) override terrain majorities to prevent hazardous obstacle smoothing.
+⭐ Risk-Adaptive Rule (TASK-010):
+----------------------------------
+When `enable_risk_adaptive=True`, coarse cells exhibiting high height variance
+(e.g., potholes, obstacles, steep terrain roughness) are dynamically subdivided
+into finer sub-cells (e.g. 15cm -> 5cm or 50cm -> 15cm), prioritizing safety
+regardless of distance from the sensor.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -54,7 +53,7 @@ RANK_TO_CLASS: Dict[int, int] = {
 
 class RingGrid:
     """
-    Adaptive Variable-Resolution 2.5D Ring Grid Engine.
+    Adaptive Variable-Resolution 2.5D Ring Grid Engine with Risk-Adaptive Subdivision.
     """
 
     def __init__(self, tiers: Optional[List[Dict[str, float]]] = None):
@@ -100,6 +99,8 @@ class RingGrid:
         points: np.ndarray,
         class_ids: np.ndarray,
         max_range: float = 100.0,
+        enable_risk_adaptive: bool = False,
+        variance_threshold: float = 0.04,
     ) -> Dict[Tuple[int, int, int], Cell]:
         """
         Project 3D point cloud into variable-resolution 2.5D grid cells.
@@ -112,6 +113,11 @@ class RingGrid:
             Semantic class IDs per point.
         max_range : float, default 100.0
             Maximum range threshold in meters (points beyond are excluded).
+        enable_risk_adaptive : bool, default False
+            If True, coarse cells with height variance exceeding variance_threshold
+            are subdivided into finer-resolution sub-cells.
+        variance_threshold : float, default 0.04
+            Height variance threshold (m^2) triggering local risk subdivision.
 
         Returns
         -------
@@ -139,54 +145,67 @@ class RingGrid:
         r = r[valid_mask]
         class_ids = class_ids[valid_mask]
 
-        # 2. Tier Assignment (Vectorized)
+        # 2. Tier Assignment (Vectorized Base Pass)
         point_tiers = self.assign_tiers(r)
-        point_sizes = self.cell_sizes[point_tiers]
 
-        # 3. Cell Coordinate Computation (Vectorized)
-        ix = np.floor(x / point_sizes).astype(np.int64)
-        iy = np.floor(y / point_sizes).astype(np.int64)
-
-        # 4. Group points into unique cells with packed 64-bit keys
-        # Format: (tier: 8 bits) | (ix + OFFSET: 28 bits) | (iy + OFFSET: 28 bits)
         OFFSET = 1 << 27
-        packed_keys = (
-            (point_tiers.astype(np.int64) << 56) |
-            ((ix + OFFSET) << 28) |
-            (iy + OFFSET)
-        )
 
-        unique_keys, inverse_idx, point_counts = np.unique(
-            packed_keys,
-            return_inverse=True,
-            return_counts=True,
-        )
+        # Helper to compute packed keys and unique cells
+        def compute_grouping(tiers_arr):
+            point_sizes = self.cell_sizes[tiers_arr]
+            ix_arr = np.floor(x / point_sizes).astype(np.int64)
+            iy_arr = np.floor(y / point_sizes).astype(np.int64)
+            packed = (
+                (tiers_arr.astype(np.int64) << 56) |
+                ((ix_arr + OFFSET) << 28) |
+                (iy_arr + OFFSET)
+            )
+            return np.unique(packed, return_inverse=True, return_counts=True)
 
+        unique_keys, inverse_idx, point_counts = compute_grouping(point_tiers)
         num_cells = len(unique_keys)
 
-        # 5. Vectorized Height and Statistical Aggregations (C-level numpy routines)
-        # Mean height
+        # 3. Risk-Adaptive Subdivision Pass (TASK-010)
+        if enable_risk_adaptive:
+            # Check height variance per cell
+            sum_z = np.bincount(inverse_idx, weights=z, minlength=num_cells)
+            mean_z = (sum_z / point_counts).astype(np.float32)
+            sum_z2 = np.bincount(inverse_idx, weights=(z ** 2), minlength=num_cells)
+            var_z = np.maximum(0.0, (sum_z2 / point_counts) - (mean_z ** 2)).astype(np.float32)
+
+            u_tiers_tmp = (unique_keys >> 56).astype(np.int32)
+            # Find coarse cells (tier > 0) where variance exceeds threshold
+            subdivide_cells = np.where((var_z >= variance_threshold) & (u_tiers_tmp > 0) & (point_counts >= 3))[0]
+
+            if len(subdivide_cells) > 0:
+                subdivide_mask = np.isin(inverse_idx, subdivide_cells)
+                # Refine to Tier 0 (or next finer tier)
+                point_tiers[subdivide_mask] = np.maximum(0, point_tiers[subdivide_mask] - 1)
+
+                # Re-compute unique cell grouping with subdivided tiers
+                unique_keys, inverse_idx, point_counts = compute_grouping(point_tiers)
+                num_cells = len(unique_keys)
+
+        # 4. Vectorized Height and Statistical Aggregations
         sum_z = np.bincount(inverse_idx, weights=z, minlength=num_cells)
         mean_z = (sum_z / point_counts).astype(np.float32)
 
-        # Variance of height: Var(z) = E[z^2] - (E[z])^2
         sum_z2 = np.bincount(inverse_idx, weights=(z ** 2), minlength=num_cells)
         var_z = np.maximum(0.0, (sum_z2 / point_counts) - (mean_z ** 2)).astype(np.float32)
 
-        # Min & Max height per cell using unbuffered ufuncs
         min_z = np.full(num_cells, np.inf, dtype=np.float32)
         np.minimum.at(min_z, inverse_idx, z)
 
         max_z = np.full(num_cells, -np.inf, dtype=np.float32)
         np.maximum.at(max_z, inverse_idx, z)
 
-        # 6. Hazard Priority Majority Class Voting
+        # 5. Hazard Priority Majority Class Voting
         pt_priorities = self.priority_lut[np.clip(class_ids, 0, 255)]
         cell_max_priorities = np.zeros(num_cells, dtype=np.int32)
         np.maximum.at(cell_max_priorities, inverse_idx, pt_priorities)
         cell_classes = self.rank_to_class_lut[cell_max_priorities]
 
-        # 7. Unpack unique coordinates & centers
+        # 6. Unpack coordinates & centers
         u_tiers = (unique_keys >> 56).astype(np.int32)
         u_ix = ((unique_keys >> 28) & 0x0FFFFFFF).astype(np.int64) - OFFSET
         u_iy = (unique_keys & 0x0FFFFFFF).astype(np.int64) - OFFSET
@@ -195,7 +214,7 @@ class RingGrid:
         u_cx = (u_ix + 0.5) * u_sizes
         u_cy = (u_iy + 0.5) * u_sizes
 
-        # 8. Fast Dictionary Assembly
+        # 7. Fast Dictionary Assembly
         grid_dict: Dict[Tuple[int, int, int], Cell] = {}
         for i in range(num_cells):
             t = int(u_tiers[i])

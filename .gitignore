@@ -11,6 +11,8 @@ __pycache__/
 # ── Dataset files — NEVER commit these ──────────────────────────────────────
 data/*.bin
 data/*.label
+data/*.zip
+data/raw/
 data/demo_sequence/
 
 # ── Node / frontend ──────────────────────────────────────────────────────────

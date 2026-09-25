@@ -70,17 +70,89 @@ function renderLevels(rows) {
 
 // ─────────────────────────────────────────────────────────────────── stream ───
 
+let pollTimer = null;
+let wsAttempts = 0;
+const MAX_WS_ATTEMPTS = 2;
+const streamParams = {
+  risk_adaptive: true,
+  compress: true,
+  conf_threshold: 0.60,
+  link_tier: null,
+  preserve_risk_on_link: true,
+};
+
+function startHttpPolling() {
+  if (pollTimer) return;
+  if (socket) {
+    socket.onclose = null;
+    socket.onerror = null;
+    socket.close();
+    socket = null;
+  }
+  setConn('live (http)', true);
+
+  async function poll() {
+    if (!streaming) {
+      pollTimer = setTimeout(poll, 400);
+      return;
+    }
+    try {
+      const q = new URLSearchParams();
+      q.set('compress', String(streamParams.compress));
+      q.set('risk_adaptive', String(streamParams.risk_adaptive));
+      q.set('conf_threshold', String(streamParams.conf_threshold));
+      if (streamParams.link_tier !== null) q.set('link_tier', String(streamParams.link_tier));
+      q.set('preserve_risk_on_link', String(streamParams.preserve_risk_on_link));
+
+      const res = await fetch(`/api/frame?${q.toString()}`);
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        const frame = await decodeFrame(buf);
+        onFrame(frame);
+        setConn('live', true);
+      } else {
+        setConn('error', false);
+      }
+    } catch (err) {
+      setConn('reconnecting', false);
+    }
+    const delay = Math.max(50, Math.floor(1000 / (system?.target_hz || 10)));
+    pollTimer = setTimeout(poll, delay);
+  }
+
+  poll();
+}
+
 function connect() {
+  if (pollTimer) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  socket = new WebSocket(`${proto}://${location.host}/ws/stream`);
+  try {
+    socket = new WebSocket(`${proto}://${location.host}/ws/stream`);
+  } catch (err) {
+    startHttpPolling();
+    return;
+  }
   socket.binaryType = 'arraybuffer';
 
-  socket.onopen = () => setConn('live', true);
-  socket.onclose = () => {
-    setConn('reconnecting', false);
-    setTimeout(connect, 1500);
+  socket.onopen = () => {
+    wsAttempts = 0;
+    setConn('live', true);
   };
-  socket.onerror = () => setConn('error', false);
+  socket.onclose = () => {
+    wsAttempts++;
+    if (wsAttempts >= MAX_WS_ATTEMPTS) {
+      startHttpPolling();
+    } else {
+      setConn('reconnecting', false);
+      setTimeout(connect, 1000);
+    }
+  };
+  socket.onerror = () => {
+    wsAttempts++;
+    if (wsAttempts >= MAX_WS_ATTEMPTS) {
+      startHttpPolling();
+    }
+  };
   socket.onmessage = async (ev) => {
     try {
       const frame = await decodeFrame(ev.data);
@@ -98,6 +170,7 @@ function setConn(text, up) {
 }
 
 function send(patch) {
+  Object.assign(streamParams, patch);
   if (socket?.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ cmd: 'set', ...patch }));
   }

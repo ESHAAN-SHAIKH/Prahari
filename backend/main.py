@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -204,6 +205,15 @@ class Pipeline:
 # ----------------------------------------------------------------------- app ---
 app = FastAPI(title="PRAHARI", version="0.1.0",
               description="Adaptive variable-resolution 2.5D LiDAR mapping — prototype")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 pipeline = Pipeline()
 evidence = Evidence()
 
@@ -257,10 +267,23 @@ def compare():
 
 
 @app.get("/api/frame")
-def frame(compress: bool = True, risk_adaptive: bool = True, link_tier: int | None = None):
+def frame(
+    compress: bool = True,
+    risk_adaptive: bool = True,
+    conf_threshold: float = C.CONF_THRESHOLD,
+    hazard_factor: float = C.HAZARD_REFINE_FACTOR,
+    link_tier: int | None = None,
+    preserve_risk_on_link: bool = True,
+):
     """One frame over plain HTTP, in the same wire format as the stream."""
-    wire, meta = pipeline.step(StreamSettings(risk_adaptive=risk_adaptive,
-                                              compress=compress, link_tier=link_tier))
+    wire, meta = pipeline.step(StreamSettings(
+        risk_adaptive=risk_adaptive,
+        compress=compress,
+        conf_threshold=conf_threshold,
+        hazard_factor=hazard_factor,
+        link_tier=link_tier,
+        preserve_risk_on_link=preserve_risk_on_link,
+    ))
     return Response(content=wire, media_type="application/octet-stream",
                     headers={"X-Prahari-Meta": json.dumps(meta)})
 

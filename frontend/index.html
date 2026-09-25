@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PRAHARI — adaptive variable-resolution 2.5D LiDAR mapping</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;450;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="mark">
+    <span class="mark-name">PRAHARI</span>
+    <span class="mark-sub">Adaptive variable-resolution 2.5D LiDAR mapping</span>
+  </div>
+
+  <nav class="views" role="tablist" aria-label="Views">
+    <button class="view-tab is-active" role="tab" aria-selected="true" data-view="live">Live map</button>
+    <button class="view-tab" role="tab" aria-selected="false" data-view="evidence">Evidence</button>
+  </nav>
+
+  <div class="masthead-right">
+    <div class="source" id="source-badge" title="Where the point cloud comes from">
+      <span class="source-dot"></span><span class="source-text">connecting</span>
+    </div>
+    <div class="ps-ref">DRDO 26053</div>
+    <button class="ctl-btn" id="stream-toggle" aria-pressed="true">Pause</button>
+  </div>
+</header>
+
+<div class="notice" id="notice" hidden></div>
+
+<main class="stage">
+
+  <!-- ─────────────────────────────────────────────── LIVE ───────────────────────── -->
+  <section class="view view-live is-active" id="view-live">
+
+    <aside class="rail" aria-label="Map controls">
+
+      <section class="rail-block">
+        <h2>Shading</h2>
+        <div class="seg" role="radiogroup" aria-label="Shading">
+          <button class="seg-btn is-on" data-mode="semantic" role="radio" aria-checked="true">Class</button>
+          <button class="seg-btn" data-mode="elevation" role="radio" aria-checked="false">Elevation</button>
+          <button class="seg-btn" data-mode="confidence" role="radio" aria-checked="false">Confidence</button>
+          <button class="seg-btn" data-mode="resolution" role="radio" aria-checked="false">Cell size</button>
+        </div>
+        <p class="rail-note" id="mode-note">Terrain, static structure and moving objects, coloured by class.</p>
+      </section>
+
+      <section class="rail-block">
+        <h2>Overlays</h2>
+        <label class="check"><input type="checkbox" id="opt-quadtree" checked><span>Cell boundaries</span></label>
+        <label class="check"><input type="checkbox" id="opt-rings" checked><span>Range rings</span></label>
+        <label class="check"><input type="checkbox" id="opt-detections" checked><span>Detected objects</span></label>
+        <label class="check"><input type="checkbox" id="opt-hazards" checked><span>Hazard marks</span></label>
+      </section>
+
+      <section class="rail-block">
+        <h2>Grid rules</h2>
+        <label class="check"><input type="checkbox" id="opt-risk" checked><span>Risk-adaptive resolution</span></label>
+        <p class="rail-note">Off, cell size follows range alone — the conventional foveated grid.</p>
+
+        <label class="slider" for="opt-conf">
+          <span class="slider-label">Degraded below</span>
+          <output id="opt-conf-out" class="num">0.60</output>
+        </label>
+        <input type="range" id="opt-conf" min="0" max="0.95" step="0.05" value="0.60">
+      </section>
+
+      <section class="rail-block">
+        <h2>Transmitted map</h2>
+        <select id="opt-tier" class="select">
+          <option value="">Onboard — full resolution</option>
+          <option value="11">Link tier — 10 cm ceiling</option>
+          <option value="10">Link tier — 20 cm ceiling</option>
+          <option value="9">Link tier — 40 cm ceiling</option>
+          <option value="8">Link tier — 80 cm ceiling</option>
+        </select>
+        <label class="check"><input type="checkbox" id="opt-preserve" checked><span>Keep hazards at full detail</span></label>
+        <p class="rail-note">What a remote node receives over the link. The onboard stack keeps the full map either way.</p>
+      </section>
+
+      <section class="rail-block rail-legend">
+        <h2>Legend</h2>
+        <div id="legend"></div>
+      </section>
+    </aside>
+
+    <section class="plot" id="plot">
+      <canvas id="map"></canvas>
+      <div class="plot-hud">
+        <div class="hud-left">
+          <div class="scalebar"><span class="scalebar-rule"></span><span class="num" id="scale-label">—</span></div>
+        </div>
+        <div class="hud-right">
+          <span class="num" id="cursor-readout">—</span>
+        </div>
+      </div>
+      <div class="plot-empty" id="plot-empty">Waiting for the first frame.</div>
+    </section>
+
+    <aside class="telemetry" aria-label="Telemetry">
+
+      <section class="tel-block tel-rate">
+        <div class="rate">
+          <span class="rate-num num" id="t-fps">—</span>
+          <span class="rate-unit">Hz</span>
+        </div>
+        <div class="rate-sub">
+          <span id="t-frame-ms" class="num">—</span> ms per frame,
+          <span id="t-frame-p95" class="num">—</span> ms at p95
+        </div>
+        <canvas class="spark" id="spark" height="34"></canvas>
+        <div class="rate-target" id="t-target">—</div>
+      </section>
+
+      <section class="tel-block">
+        <h2>Where the time goes</h2>
+        <div class="stages" id="stages"></div>
+      </section>
+
+      <section class="tel-block">
+        <h2>Map</h2>
+        <dl class="kv">
+          <dt>Points in</dt><dd class="num" id="t-points">—</dd>
+          <dt>Cells out</dt><dd class="num" id="t-cells">—</dd>
+          <dt>Finest cell</dt><dd class="num" id="t-cellmin">—</dd>
+          <dt>Coarsest cell</dt><dd class="num" id="t-cellmax">—</dd>
+          <dt>Elevation span</dt><dd class="num" id="t-elev">—</dd>
+        </dl>
+      </section>
+
+      <section class="tel-block">
+        <h2>Memory against the alternatives</h2>
+        <div class="bars" id="mem-bars"></div>
+        <p class="tel-note" id="mem-note"></p>
+      </section>
+
+      <section class="tel-block">
+        <h2>Link</h2>
+        <dl class="kv">
+          <dt>Frame on the wire</dt><dd class="num" id="t-wire">—</dd>
+          <dt>Compression</dt><dd class="num" id="t-ratio">—</dd>
+          <dt>Sustained</dt><dd class="num" id="t-mbps">—</dd>
+        </dl>
+        <div class="link-fit" id="link-fit"></div>
+      </section>
+
+      <section class="tel-block">
+        <h2>Risk</h2>
+        <dl class="kv">
+          <dt>Hazard cells</dt><dd class="num" id="t-haz">—</dd>
+          <dt>Beyond the fovea</dt><dd class="num" id="t-hazfar">—</dd>
+          <dt>Degraded sensing</dt><dd class="num" id="t-degraded">—</dd>
+          <dt>Set by a risk rule</dt><dd class="num" id="t-risk">—</dd>
+        </dl>
+        <div class="drivers" id="drivers"></div>
+      </section>
+
+      <section class="tel-block">
+        <h2>Tracked objects</h2>
+        <div class="objects" id="objects"><p class="tel-note">None in range.</p></div>
+      </section>
+    </aside>
+  </section>
+
+  <!-- ───────────────────────────────────────────── EVIDENCE ─────────────────────── -->
+  <section class="view view-evidence" id="view-evidence">
+    <div class="evidence-inner">
+      <header class="ev-head">
+        <h1>Measured evidence</h1>
+        <p class="ev-lede">
+          Everything below is read from the training notebook's evidence export. Nothing on this
+          page is computed here, and nothing unmeasured is given a stand-in number.
+        </p>
+        <div class="ev-meta" id="ev-meta"></div>
+      </header>
+
+      <section class="ev-section" id="ev-perclass">
+        <h2>Accuracy by category</h2>
+        <div class="ev-body"></div>
+      </section>
+
+      <section class="ev-section" id="ev-distance">
+        <h2>Accuracy by range band</h2>
+        <div class="ev-body"></div>
+      </section>
+
+      <section class="ev-section" id="ev-edge">
+        <h2>On-device performance</h2>
+        <div class="ev-body"></div>
+      </section>
+
+      <section class="ev-section" id="ev-baselines">
+        <h2>Named baselines</h2>
+        <div class="ev-body"></div>
+      </section>
+
+      <section class="ev-section" id="ev-live">
+        <h2>Measured here, this session</h2>
+        <div class="ev-body"></div>
+      </section>
+
+      <section class="ev-section" id="ev-checklist">
+        <h2>Verification checklist</h2>
+        <div class="ev-body"></div>
+      </section>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <div class="levels" id="levels"></div>
+  <div class="statusbar-right">
+    <span id="frame-id" class="num">—</span>
+    <span class="sep"></span>
+    <span id="conn" class="conn">offline</span>
+  </div>
+</footer>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

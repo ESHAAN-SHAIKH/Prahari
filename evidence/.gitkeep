@@ -1,0 +1,4 @@
+Place trinetra_evidence_export.json (and the sibling ps_category_table_*.json /
+distance_stratified_*.json files) from the training notebook's Phase 7 here, or point
+PRAHARI_EVIDENCE at wherever you keep them. Empty by default — the Evidence tab will
+correctly show every block as "Not measured" until a real export lands here.
